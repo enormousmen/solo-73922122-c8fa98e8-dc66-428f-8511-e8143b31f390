@@ -26,6 +26,9 @@
   .badge.phase-NORMAL { background:#dafbe1; color:var(--ok); }
   .badge.phase-SWITCH_PENDING,.badge.phase-ROLLBACK { background:#fff8c5; color:var(--warn); }
   .badge.phase-PROMOTED { background:#ddf4ff; color:#0969da; }
+  .badge.phase-BUILDING { background:#fff8c5; color:var(--warn); }
+  .badge.phase-FAILED { background:#ffebe9; color:var(--err); }
+  .badge.phase-IDLE { background:#dafbe1; color:var(--ok); }
   form { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   input[type=text],select { padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; flex:1; min-width:160px; }
   button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:#f6f8fa; cursor:pointer; font-size:14px; }
@@ -69,12 +72,26 @@
           <option value="">当前写入主库</option>
           <option value="A">节点 A</option>
           <option value="B">节点 B</option>
+          <option value="C">节点 C（B 的物理备库）</option>
         </select>
         <button type="submit">查询</button>
       </form>
       <div id="records"></div>
     </section>
   </div>
+
+  <section class="card">
+    <h2>为节点 C 重建物理备库（B 接管写入后）</h2>
+    <form id="build-form" style="margin-bottom:10px">
+      <button class="primary" type="submit" id="build-btn">确认 B 已接管写入，从 B 给 C 建物理备库</button>
+      <span class="muted">建库期间 B 照常接收网页录入；重复点击显示同一次任务</span>
+    </form>
+    <table id="build-table"><tbody></tbody></table>
+    <p class="muted">
+      备库可用条件（每次刷新实时核对）：C 正从 B 流复制，且回放已达到受理时 B 的 WAL 位置；
+      探测到断流立即变为未就绪，重连后重新核对。
+    </p>
+  </section>
 
   <section class="card">
     <h2>单向切换 / 回放控制</h2>
@@ -137,6 +154,7 @@ async function refresh() {
           <td>WAL LSN <code>${esc(n.wal_lsn ?? "-")}</code></td>
           <td>回放 LSN <code>${esc(n.replay_lsn ?? "-")}</code></td>
           <td>回放暂停 ${n.replay_paused===null?"-":(n.replay_paused?"是":"否")}</td>
+          ${n.streaming!==undefined?`<td>流复制=${n.streaming?`<span class="badge primary">${esc(n.wal_receiver_status)}</span>`:'<span class="badge unknown">断流</span>'}</td>`:""}
           ${n.read_only!==undefined?`<td>只读=${n.read_only?"是":"否"}</td>`:""}
           ${n.error?`<td class="hist-result-TIMEOUT">${esc(n.error)}</td>`:""}
         </tr>`).join("")
@@ -148,6 +166,36 @@ async function refresh() {
       <td>${esc(h.old_leader)} → ${esc(h.new_leader)}</td><td><code>${esc(h.target_lsn)}</code></td>
       <td class="hist-result-${esc(h.result)}">${esc(h.result)}</td><td>${esc(h.message)}</td>
     </tr>`).join("") : `<tr><td colspan="6" class="muted">暂无切换记录</td></tr>`;
+
+    // 节点 C 建库任务面板
+    const build = s.standby_build;
+    const buildBtn = $("build-btn");
+    if (build) {
+      const cur = build.current_build;
+      const building = build.phase === "BUILDING";
+      // 按钮保持可点：建库进行中重复点击由后端幂等返回同一次任务。
+      buildBtn.disabled = false;
+      buildBtn.textContent = building
+        ? `建库进行中（任务 ${cur ? esc(cur.task_id) : ""}），点击仍显示同一次任务`
+        : "确认 B 已接管写入，从 B 给 C 建物理备库";
+      const lastHist = build.history.length ? build.history[build.history.length-1] : null;
+      const rows = [
+        ["建库阶段", `<span class="badge phase-${esc(build.phase)}">${esc(build.phase)}</span>`],
+        ["当前任务", cur ? `${esc(cur.task_id)}（受理 LSN <code>${esc(cur.accepted_lsn)}</code>，开始 ${new Date(cur.started_at*1000).toLocaleString()}）` : "-"],
+        ["备库可用（实时核对）", build.ready
+          ? '<span class="badge primary">READY：C 正从 B 流复制且回放已达受理位置</span>'
+          : '<span class="badge unknown">未就绪</span>'],
+        ["未就绪原因", esc(build.last_not_ready_reason ?? "-")],
+        ["最近核对时间", build.last_checked_at ? new Date(build.last_checked_at*1000).toLocaleString() : "-"],
+        ["上次建库结果", lastHist ? `<span class="hist-result-${esc(lastHist.result)}">${esc(lastHist.result)}</span>：${esc(lastHist.message)}` : "暂无"],
+      ];
+      $("build-table").querySelector("tbody").innerHTML =
+        rows.map(r=>`<tr><th>${r[0]}</th><td>${r[1]}</td></tr>`).join("");
+    } else {
+      buildBtn.disabled = true;
+      $("build-table").querySelector("tbody").innerHTML =
+        `<tr><th>节点 C</th><td class="muted">未配置（PG_C_HOST），建库功能不可用</td></tr>`;
+    }
   } catch (e) {
     showMsg("状态刷新失败：" + e.message, "err");
   }
@@ -196,6 +244,17 @@ $("replay-form").addEventListener("submit", async (ev) => {
     const r = await api(isPause ? "/api/replay/pause" : "/api/replay/resume", {method:"POST", body:"{}"});
     showMsg(`节点 ${r.node} 回放已${r.replay_paused?"暂停（切换将在超时后回滚）":"恢复，重新发起切换即可成功"}`, r.replay_paused?"warn":"ok");
   } catch (e) { showMsg("回放控制失败：" + e.message, "err"); }
+  refresh();
+});
+
+$("build-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await api("/api/standby/c/build", {method:"POST", body:"{}"});
+    showMsg((r.idempotent ? "（幂等）" : "") + r.message, "warn");
+  } catch (e) {
+    showMsg("建库被拒：" + e.message, "err");
+  }
   refresh();
 });
 

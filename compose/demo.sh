@@ -77,4 +77,46 @@ api GET /api/status | jq '{phase: .cluster.phase, leader: .cluster.leader}'
 api POST /api/records '{"content":"record-after-web-restart"}' | jq .
 api GET /api/records | jq '{node, latest: .records[0].content}'
 
-slog "全部演示步骤完成"
+slog "7. 从 B 给节点 C 建物理备库（建库期间 B 照常接收录入）"
+# 受理前校验：当前主库必须是 B，否则接口 409。
+api POST /api/standby/c/build | jq '{accepted, idempotent, task_id}'
+# 建库进行中重复点击：必须返回同一个任务号（幂等）。
+TASK_ID=$(api GET /api/status | jq -r '.standby_build.current_build.task_id')
+api POST /api/standby/c/build | jq -e --arg t "$TASK_ID" '.idempotent==true and .task_id==$t' >/dev/null \
+  && echo "OK: 重复点击返回同一任务 $TASK_ID"
+# 建库期间继续往 B 录入，写入不中断。
+api POST /api/records '{"content":"record-during-c-build"}' | jq '{id, node, content}'
+
+# 轮询直到建库任务归档（IDLE），再核对实时可用性。
+deadline=$((SECONDS + 120))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  phase=$(api GET /api/status | jq -r '.standby_build.phase')
+  [ "$phase" = "FAILED" ] && { api GET /api/status | jq .standby_build >&2; echo "建库失败" >&2; exit 1; }
+  [ "$phase" = "IDLE" ] && break
+  sleep 2
+done
+[ "$phase" = "IDLE" ] || { echo "等待 C 建库完成超时" >&2; exit 1; }
+
+# 备库可用 = C 正从 B 流复制 且 回放达到受理时 B 的 WAL 位置（每次现查）。
+for _ in $(seq 1 30); do
+  ready=$(api GET /api/standby/c | jq -r '.ready')
+  [ "$ready" = "true" ] && break
+  sleep 2
+done
+api GET /api/standby/c | jq '{ready, reason, build_phase: .build.phase, node: {name: .node.name, role: .node.role, streaming: .node.streaming}}'
+[ "$ready" = "true" ] || { echo "C 未达到可用条件" >&2; exit 1; }
+
+slog "8. C 可用后再录入一条，并从 C 查到它"
+FINAL="record-on-c-$RANDOM"
+api POST /api/records "{\"content\":\"$FINAL\"}" | jq .
+for _ in $(seq 1 30); do
+  api GET '/api/records?node=C&limit=200' | jq -e --arg c "$FINAL" '.records[]|select(.content==$c)' >/dev/null && break
+  sleep 2
+done
+api GET '/api/records?node=C&limit=200' | jq -e --arg c "$FINAL" '.records[]|select(.content==$c)' >/dev/null \
+  && echo "OK: 记录 $FINAL 已从 C 查到"
+api GET '/api/records?node=C&limit=200' \
+  | jq -e '.records[]|select(.content=="record-during-c-build")' >/dev/null \
+  && echo "OK: 建库期间的录入也已流到 C"
+
+slog "全部演示步骤完成（含节点 C 物理备库重建）"

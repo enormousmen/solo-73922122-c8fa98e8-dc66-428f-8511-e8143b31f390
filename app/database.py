@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg
 
+from .builder import read_env_file, write_env_file
 from .config import NodeConfig, Settings
 from .state import SwitchError
 
@@ -34,6 +35,9 @@ class PgClusterAdapter:
             settings.node_a.name: settings.node_a,
             settings.node_b.name: settings.node_b,
         }
+        if settings.node_c is not None:
+            self._nodes[settings.node_c.name] = settings.node_c
+        self._control_dir = settings.build_control_dir
 
     def _dsn(self, node: str, admin: bool = False) -> str:
         try:
@@ -164,6 +168,69 @@ class PgClusterAdapter:
             in_recovery, paused = cur.fetchone()
             return bool(paused) if in_recovery else None
 
+    # --- 节点 C 建库：流复制核对与控制卷文件 ------------------------------ #
+    def standby_streaming(self, upstream: str, standby: str) -> Dict[str, Any]:
+        """实时核对 standby 是否正从 upstream 流复制，并返回 LSN 信息。
+
+        判定依据（全部满足才算“正在流复制”）：
+        - C 处于 recovery（``pg_is_in_recovery()=t``）
+        - ``pg_stat_wal_receiver`` 有已连接行，status='streaming'
+        - 接收连接的上游主机/端口与期望的上游节点一致
+        """
+        upstream_cfg = self._nodes[upstream]
+        with self._connect(standby, admin=True) as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_is_in_recovery()")
+            in_recovery = bool(cur.fetchone()[0])
+            info: Dict[str, Any] = {
+                "in_recovery": in_recovery,
+                "streaming": False,
+                "upstream_host": None,
+                "upstream_port": None,
+                "receive_lsn": None,
+                "replay_lsn": None,
+                "status": None,
+            }
+            if not in_recovery:
+                return info
+            cur.execute("SELECT pg_last_wal_replay_lsn()::text")
+            info["replay_lsn"] = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT status, conninfo
+                FROM pg_stat_wal_receiver
+                """
+            )
+            row = cur.fetchone()
+            if row is None:
+                return info
+            status, conninfo = row
+            info["status"] = status
+            # PG15 的 pg_stat_wal_receiver 没有 received_lsn（PG16 才加入），
+            # 接收位置统一用 pg_last_wal_receive_lsn() 获取。
+            cur.execute("SELECT pg_last_wal_receive_lsn()::text")
+            info["receive_lsn"] = cur.fetchone()[0]
+            # conninfo 是标准连接串（可能含空格/引号），交给 psycopg 解析，
+            # 不自行 split 以免密码等字段里的空格破坏解析。
+            try:
+                from psycopg.conninfo import conninfo_to_dict
+                params = conninfo_to_dict(conninfo or "")
+            except Exception:
+                params = {}
+            info["upstream_host"] = params.get("host")
+            info["upstream_port"] = params.get("port")
+            info["streaming"] = (
+                status == "streaming"
+                and params.get("host") == upstream_cfg.host
+                and str(params.get("port")) == str(upstream_cfg.port)
+            )
+            return info
+
+    def write_control_file(self, name: str, lines: Dict[str, str]) -> None:
+        write_env_file(f"{self._control_dir}/{name}", lines)
+
+    def read_control_file(self, name: str) -> Optional[Dict[str, str]]:
+        return read_env_file(f"{self._control_dir}/{name}")
+
     # --- 集群状态 ------------------------------------------------------ #
     def node_status(self, node: str) -> Dict[str, Any]:
         cfg = self._nodes[node]
@@ -193,6 +260,14 @@ class PgClusterAdapter:
                     status["replay_paused"] = bool(paused)
                     cur.execute("SELECT pg_last_wal_receive_lsn()::text")
                     status["wal_lsn"] = cur.fetchone()[0]
+                    if node == "C":
+                        # C 的流复制状态单独展示，断流时页面立即可见。
+                        cur.execute(
+                            "SELECT status, conninfo FROM pg_stat_wal_receiver"
+                        )
+                        wr = cur.fetchone()
+                        status["wal_receiver_status"] = wr[0] if wr else None
+                        status["streaming"] = bool(wr and wr[0] == "streaming")
                 else:
                     cur.execute("SELECT pg_current_wal_lsn()::text")
                     status["wal_lsn"] = cur.fetchone()[0]
@@ -207,9 +282,18 @@ class PgClusterAdapter:
 
     def ensure_schema(self) -> None:
         # 建表需要建表权限：由初始化脚本 GRANT 给 app 角色；DDL 经流复制到备库。
-        leader = self.settings.node_a.name  # 仅启动阶段调用，初始主固定为 A
-        with self._connect(leader) as conn, conn.cursor() as cur:
-            cur.execute(CREATE_TABLE_SQL)
+        # 启动时 A/B 谁是主库就连谁（切换后重启，主库可能已经是 B）。
+        for candidate in (self.settings.node_a.name, self.settings.node_b.name):
+            try:
+                if self.is_in_recovery(candidate):
+                    continue
+                with self._connect(candidate) as conn, conn.cursor() as cur:
+                    cur.execute(CREATE_TABLE_SQL)
+                logger.info("演示表已在节点 %s 上确认存在", candidate)
+                return
+            except Exception as exc:
+                logger.info("节点 %s 暂不可用于建表：%r", candidate, exc)
+        logger.warning("暂无可达主库，建表推迟到下一轮")
 
     # --- 示例记录读写 -------------------------------------------------- #
     def insert_record(self, node: str, content: str) -> Dict[str, Any]:

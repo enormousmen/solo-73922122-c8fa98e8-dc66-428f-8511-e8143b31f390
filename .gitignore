@@ -6,7 +6,9 @@
 /pgdata4/
 /pgdata5/
 /pg-local/
+# 集成自测（dev/agent_it.sh、dev/web_it.py）的临时集群目录
+/pg-c-e2e/
+/tmp/
 *.pyc
 __pycache__/
 .pytest_cache/
-/tmp/

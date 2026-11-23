@@ -1,4 +1,4 @@
-"""FastAPI 入口：状态/记录接口、切换受理、回放控制和演示页面。"""
+"""FastAPI 入口：状态/记录接口、切换受理、回放控制、节点 C 建库和演示页面。"""
 from __future__ import annotations
 
 import logging
@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from .build_state import BUILD_BUILDING, BUILD_IDLE, BuildStateStore, BuildError
+from .builder import StandbyBuilder
 from .config import Settings
 from .database import PgClusterAdapter
 from .state import PHASE_NORMAL, StateStore, SwitchError
@@ -39,6 +41,7 @@ class ReplayIn(BaseModel):
 
 def _make_lifespan(settings: Settings, store: StateStore,
                    adapter: PgClusterAdapter, switcher: Switcher,
+                   builder: Optional[StandbyBuilder], build_store: BuildStateStore,
                    wake: threading.Event):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -55,6 +58,13 @@ def _make_lifespan(settings: Settings, store: StateStore,
             except Exception as exc:
                 logger.info("等待主库就绪以建表（%s/60）：%r", attempt + 1, exc)
                 wake.wait(2.0)
+        # 3. 建库任务续跑：容器重启后按 C 代理写出的实际状态推进，
+        #    已建好的数据目录会被代理直接复用，不会重做基础备份。
+        if builder is not None:
+            try:
+                builder.run_once()
+            except Exception as exc:
+                logger.exception("建库任务启动续跑失败：%r", exc)
 
         def worker() -> None:
             # 用 Event 等待而不是 time.sleep：切换受理、回放恢复后可立即唤醒推进。
@@ -63,8 +73,13 @@ def _make_lifespan(settings: Settings, store: StateStore,
                     state = store.load()
                     if state.phase != PHASE_NORMAL:
                         switcher.run_once()
+                    if builder is not None:
+                        builder.run_once()
+                        # 每轮实时核对 C 的流复制与回放位置：
+                        # 探测到断流立即把可用性改为未就绪，重连后重新核对。
+                        builder.poll_and_cache_readiness()
                 except Exception as exc:
-                    logger.exception("切换工作线程出错：%r", exc)
+                    logger.exception("后台工作线程出错：%r", exc)
                 wake.wait(timeout=max(0.5, settings.poll_interval))
                 wake.clear()
 
@@ -90,14 +105,27 @@ def create_app(
         poll_interval=settings.poll_interval,
         promote_wait_seconds=settings.promote_wait_seconds,
     )
+    build_store = BuildStateStore(settings.build_state_file)
+    # 未配置节点 C（离线单测）时建库功能整体停用。
+    builder: Optional[StandbyBuilder] = (
+        StandbyBuilder(build_store, adapter, settings.build_control_dir,
+                       poll_interval=settings.poll_interval)
+        if settings.node_c is not None
+        else None
+    )
 
     wake = threading.Event()
-    app = FastAPI(title="PostgreSQL 主备切换演示", lifespan=_make_lifespan(settings, store, adapter, switcher, wake))
+    app = FastAPI(title="PostgreSQL 主备切换演示",
+                  lifespan=_make_lifespan(settings, store, adapter, switcher,
+                                          builder, build_store, wake))
     app.state.settings = settings
     app.state.store = store
     app.state.adapter = adapter
     app.state.switcher = switcher
+    app.state.build_store = build_store
+    app.state.builder = builder
     switch_lock = threading.Lock()
+    build_lock = threading.Lock()
 
     # ---------------- 页面 ---------------- #
     @app.get("/", response_class=HTMLResponse)
@@ -109,11 +137,22 @@ def create_app(
     @app.get("/api/status")
     def status() -> dict:
         state = store.load()
-        nodes = [adapter.node_status(name) for name in ("A", "B")]
-        return {
+        node_names = ["A", "B"] + (["C"] if settings.node_c is not None else [])
+        nodes = [adapter.node_status(name) for name in node_names]
+        response = {
             "cluster": state.public_view(),
             "nodes": nodes,
         }
+        if builder is not None:
+            build_state = build_store.load()
+            # 权威可用性每次现查：断流立即体现为未就绪，重连后重新核对。
+            try:
+                builder.poll_and_cache_readiness()
+                build_state = build_store.load()
+            except Exception as exc:
+                logger.warning("C 备库可用性核对失败：%r", exc)
+            response["standby_build"] = build_state.public_view()
+        return response
 
     # ---------------- 示例记录 ---------------- #
     @app.post("/api/records", status_code=201)
@@ -152,8 +191,12 @@ def create_app(
     def get_records(node: Optional[str] = None, limit: int = 50) -> dict:
         state = store.load()
         target = node or state.leader
-        if target not in ("A", "B"):
-            raise HTTPException(400, detail={"error": "BAD_NODE", "message": "node 只能是 A 或 B"})
+        allowed = ("A", "B") + (("C",) if settings.node_c is not None else ())
+        if target not in allowed:
+            raise HTTPException(
+                400,
+                detail={"error": "BAD_NODE", "message": f"node 只能是 {'/'.join(allowed)}"},
+            )
         try:
             rows = adapter.list_records(target, limit=min(max(1, limit), 200))
         except Exception as exc:
@@ -208,6 +251,86 @@ def create_app(
             raise HTTPException(409, detail={"error": "NOT_STANDBY", "message": str(exc)})
         wake.set()
         return {"node": node, "replay_paused": False}
+
+    # ---------------- 节点 C 物理备库建库 ---------------- #
+    @app.post("/api/standby/c/build")
+    def build_standby_c() -> dict:
+        """确认 B 已接管写入后，从 B 给节点 C 建物理备库。
+
+        - 仅当当前写入主库为 B 时受理（B 未接管写入直接拒绝）
+        - 建库进行中重复点击返回同一次任务，不新建任务
+        - 基础备份中断后页面提示失败，可重新发起；C 已有完整数据目录则复用
+        - 建库期间 B 照常接收网页录入（不改动切换状态机，不拦截写入）
+        """
+        if builder is None:
+            raise HTTPException(
+                503,
+                detail={"error": "NODE_C_DISABLED",
+                        "message": "未配置节点 C（PG_C_HOST），建库功能不可用"},
+            )
+        with build_lock:
+            state = store.load()
+            current = build_store.load()
+            # 幂等：建库进行中，重复点击仍显示同一次任务。
+            if current.phase == BUILD_BUILDING and current.current is not None:
+                return {
+                    "accepted": True,
+                    "idempotent": True,
+                    "message": "建库任务已在进行中，显示同一次任务",
+                    "task_id": current.current.task_id,
+                    "build": current.public_view(),
+                }
+            # 已成功建过完整备库：C 代理已 exec postgres、不再轮询请求文件，
+            # 此时再下发请求不会被消费。改为返回当前实时可用性，避免任务悬挂。
+            if current.phase == BUILD_IDLE and builder.is_complete_built():
+                ready, reason = builder.check_ready()
+                build_store.update_readiness(ready, reason)
+                return {
+                    "accepted": False,
+                    "idempotent": True,
+                    "already_built": True,
+                    "message": (
+                        "C 的物理备库已建好并复用现有数据目录；当前"
+                        + ("备库可用（正从 B 流复制且回放达标）" if ready
+                           else f"未就绪：{reason}")
+                    ),
+                    "task_id": current.history[-1].task_id,
+                    "build": build_store.load().public_view(),
+                }
+            try:
+                task_id = builder.start_build(state.leader)
+            except BuildError as exc:
+                raise HTTPException(
+                    409, detail={"error": "BUILD_REJECTED", "message": str(exc)}
+                )
+            wake.set()
+            return {
+                "accepted": True,
+                "idempotent": False,
+                "message": (
+                    "建库已受理：C 将从 B 做完整物理基础备份，"
+                    "期间 B 照常接收网页录入；C 回放达到受理时 B 的 WAL 位置后才显示可用"
+                ),
+                "task_id": task_id,
+                "build": build_store.load().public_view(),
+            }
+
+    @app.get("/api/standby/c")
+    def standby_c_status() -> dict:
+        if builder is None:
+            raise HTTPException(
+                503,
+                detail={"error": "NODE_C_DISABLED",
+                        "message": "未配置节点 C（PG_C_HOST），建库功能不可用"},
+            )
+        ready = builder.poll_and_cache_readiness()
+        reason = build_store.load().last_not_ready_reason
+        return {
+            "ready": ready,
+            "reason": reason,
+            "build": build_store.load().public_view(),
+            "node": adapter.node_status("C"),
+        }
 
     return app
 

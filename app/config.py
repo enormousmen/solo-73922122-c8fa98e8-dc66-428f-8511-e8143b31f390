@@ -35,6 +35,10 @@ class Settings:
     poll_interval: float
     promote_wait_seconds: int
     background_worker: bool = True
+    # 节点 C（B 接管写入后新建的物理备库）相关配置
+    node_c: NodeConfig | None = None
+    build_state_file: str = "/data/state/build.json"
+    build_control_dir: str = "/data/c-control"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,6 +62,8 @@ class Settings:
 
         node_a = make_node("A", "PG_A_HOST", "primary")
         node_b = make_node("B", "PG_B_HOST", "standby")
+        # 显式配置 PG_C_HOST 才启用节点 C 建库功能；离线单测不配则整体停用。
+        node_c = make_node("C", "PG_C_HOST", "node-c") if os.getenv("PG_C_HOST") else None
         return cls(
             node_a=node_a,
             node_b=node_b,
@@ -66,4 +72,7 @@ class Settings:
             poll_interval=float(os.getenv("POLL_INTERVAL", "1")),
             promote_wait_seconds=int(os.getenv("PROMOTE_WAIT_SECONDS", "30")),
             background_worker=os.getenv("ENABLE_BACKGROUND_WORKER", "1") not in ("0", "false", "False"),
+            node_c=node_c,
+            build_state_file=os.getenv("BUILD_STATE_FILE", "/data/state/build.json"),
+            build_control_dir=os.getenv("BUILD_CONTROL_DIR", "/data/c-control"),
         )

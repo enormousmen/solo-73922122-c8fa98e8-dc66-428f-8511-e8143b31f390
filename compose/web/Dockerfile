@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv/app
 
-COPY requirements.txt .
+# 构建上下文为仓库根目录（见 docker-compose.yml 的 build.context）
+COPY compose/web/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app

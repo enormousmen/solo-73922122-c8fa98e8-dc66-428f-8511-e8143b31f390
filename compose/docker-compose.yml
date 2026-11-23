@@ -1,4 +1,4 @@
-# PostgreSQL 主备单向切换演示平台
+# PostgreSQL 主备单向切换 + 节点 C 物理备库重建演示平台
 # 启动：docker compose up -d --build
 services:
   primary:
@@ -49,8 +49,39 @@ services:
     networks:
       - demo-net
 
+  # 节点 C：独立数据卷。容器启动后只运行代理，等待网页下发建库请求；
+  # 网页确认 B 接管写入后，代理才从 B 做 pg_basebackup 并以流复制备库启动。
+  node-c:
+    image: postgres:15-bookworm
+    container_name: demo-node-c
+    # 不 depends_on 任何库：C 在请求下发前保持空闲，B 提升后才会成为其上游。
+    environment:
+      SOURCE_HOST: standby
+      CONTROL_DIR: /data/c-control
+      PGDATA: /var/lib/postgresql/data
+      PG_PORT: "5432"
+      BUILD_MODE: ${NODE_C_BUILD_MODE:-basebackup}
+      # 自测故障注入：置 1 后第一次基础备份必失败（验证中断提示与重新发起）
+      FAIL_BASEBACKUP_ONCE: ${FAIL_BASEBACKUP_ONCE:-0}
+      PG_REPL_USER: ${PG_REPL_USER:-repl}
+      PG_REPL_PASSWORD: ${PG_REPL_PASSWORD:-replpass}
+      PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
+      PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD:-postgres-pass}
+    volumes:
+      - node-c-data:/var/lib/postgresql/data
+      # 网页与 C 代理通过该共享卷交换 request.env / status.env / backup.complete
+      - c-control:/data/c-control
+      - ./postgres/node-c/entrypoint.sh:/usr/local/bin/node-c-entrypoint.sh:ro
+    entrypoint: ["/usr/local/bin/node-c-entrypoint.sh"]
+    networks:
+      - demo-net
+
   web:
-    build: ./web
+    # 构建上下文是 compose/（仓库根的 app/ 通过 ../app 进入上下文见 .dockerignore），
+    # Dockerfile 仍放在 web/ 下，用 context+dockerfile 显式指定。
+    build:
+      context: ..
+      dockerfile: compose/web/Dockerfile
     container_name: demo-web
     depends_on:
       primary:
@@ -60,17 +91,22 @@ services:
     environment:
       PG_A_HOST: primary
       PG_B_HOST: standby
+      PG_C_HOST: node-c
       PG_APP_USER: ${PG_APP_USER:-app}
       PG_APP_PASSWORD: ${PG_APP_PASSWORD:-apppass}
       PG_APP_DB: ${PG_APP_DB:-appdb}
       PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
       PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD:-postgres-pass}
       STATE_FILE: /data/state/switch.json
+      BUILD_STATE_FILE: /data/state/build.json
+      BUILD_CONTROL_DIR: /data/c-control
       SWITCH_TIMEOUT: ${SWITCH_TIMEOUT:-20}
       POLL_INTERVAL: ${POLL_INTERVAL:-1}
       PROMOTE_WAIT_SECONDS: ${PROMOTE_WAIT_SECONDS:-30}
     volumes:
       - web-state:/data/state
+      # 与 node-c 共享控制卷：网页写 request.env，读 status.env
+      - c-control:/data/c-control
     ports:
       - "${WEB_PORT:-8000}:8000"
     networks:
@@ -79,7 +115,9 @@ services:
 volumes:
   primary-data:
   standby-data:
+  node-c-data:
   web-state:
+  c-control:
 
 networks:
   demo-net:
